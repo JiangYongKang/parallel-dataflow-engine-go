@@ -1,5 +1,7 @@
 package engine
 
+import "sort"
+
 // Status 标记单个节点的终态。
 type Status int
 
@@ -11,7 +13,22 @@ const (
 	StatusCanceled
 )
 
-func (s Status) String() string { return "" }
+func (s Status) String() string {
+	switch s {
+	case StatusSuccess:
+		return "success"
+	case StatusFailed:
+		return "failed"
+	case StatusTimeout:
+		return "timeout"
+	case StatusSkipped:
+		return "skipped"
+	case StatusCanceled:
+		return "canceled"
+	default:
+		return "unknown"
+	}
+}
 
 // Result 是单个节点的执行结果。
 type Result struct {
@@ -30,7 +47,27 @@ type Output struct {
 }
 
 // Get 仅当节点成功且整体结果完整时返回其值。
-func (o *Output) Get(id string) (any, bool) { return nil, false }
+func (o *Output) Get(id string) (any, bool) {
+	if o == nil || !o.Complete {
+		return nil, false
+	}
+	r, ok := o.Results[id]
+	if !ok || r.Status != StatusSuccess {
+		return nil, false
+	}
+	return r.Value, true
+}
 
 // Ordered 按节点 ID 字典序返回结果，保证与调度顺序无关的稳定输出。
-func (o *Output) Ordered() []Result { return nil }
+func (o *Output) Ordered() []Result {
+	ids := make([]string, 0, len(o.Results))
+	for id := range o.Results {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]Result, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, o.Results[id])
+	}
+	return out
+}
