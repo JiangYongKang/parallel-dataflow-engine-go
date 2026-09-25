@@ -96,8 +96,8 @@ func (e *Engine) run(ctx context.Context, g *Graph) *Output {
 		}()
 	}
 
-	terminal := 0   // 已有终态结果的节点数
-	inflight := 0   // 已派发未回收的节点数
+	terminal := 0 // 已有终态结果的节点数
+	inflight := 0 // 已派发未回收的节点数
 	dispatched := make(map[string]bool, n)
 
 	tryDispatch := func(id string) {
