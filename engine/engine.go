@@ -9,28 +9,57 @@ import (
 )
 
 // Engine 是并行数据流执行引擎。
+// 同一实例可长期复用、可被多个 goroutine 并发调用 Run；
+// 启用缓存后，多次运行之间复用未变化任务的成功结果。
 type Engine struct {
-	cfg Config
+	cfg   Config
+	cache *resultCache // nil 表示未启用跨运行缓存
 }
 
 // New 以给定配置创建引擎。
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg.withDefaults()}
+	e := &Engine{cfg: cfg.withDefaults()}
+	if cfg.CacheSize > 0 {
+		e.cache = newResultCache(cfg.CacheSize)
+	}
+	return e
+}
+
+// ClearCache 主动清空跨运行结果缓存（未启用缓存时为 no-op）。
+func (e *Engine) ClearCache() {
+	if e.cache != nil {
+		e.cache.clear()
+	}
+}
+
+// CacheStats 返回缓存状况快照；未启用缓存时 Enabled=false。
+func (e *Engine) CacheStats() CacheStats {
+	if e.cache == nil {
+		return CacheStats{}
+	}
+	return e.cache.stats()
 }
 
 // Run 校验并执行整个任务图，返回汇总结果。
 // 保证：
 //   - 结果与并发度、调度顺序无关（按任务 ID 汇总，计算只依赖上游输出）；
+//   - 任务定义不合法（空 ID / 无计算体）在开跑前整体拒绝，返回 ErrInvalidTask；
 //   - 依赖成环 / 引用缺失节点时拒绝执行并返回可区分错误；
 //   - 失败、超时、取消时下游被跳过，部分结果被标记为不完整；
+//   - 启用缓存（Config.CacheSize>0）时，定义未变且上游产物来源一致的任务
+//     直接复用上次成功结果（Result.Reused=true），只增量重算受影响子图；
+//     失败/超时/取消的产物绝不写入缓存；
 //   - 并发受 MaxConcurrency 约束，内部缓冲受 BufferSize 约束（背压）；
 //   - 返回前所有执行单元均已回收，无 goroutine 泄漏。
 func (e *Engine) Run(ctx context.Context, tasks []Task) *RunResult {
 	nodes, topo, err := buildGraph(tasks)
 	if err != nil {
 		kind := FailureMissingDep
-		if errors.Is(err, ErrCycle) {
+		switch {
+		case errors.Is(err, ErrCycle):
 			kind = FailureCycle
+		case errors.Is(err, ErrInvalidTask):
+			kind = FailureInvalidTask
 		}
 		e.cfg.logf("graph rejected: %v", err)
 		return &RunResult{Results: map[string]Result{}, Complete: false, Err: err, Kind: kind}
@@ -43,18 +72,33 @@ func (e *Engine) Run(ctx context.Context, tasks []Task) *RunResult {
 	}
 
 	r := &runner{
-		cfg:       e.cfg,
-		nodes:     nodes,
-		remaining: len(topo),
-		pending:   make(map[string]int, len(nodes)),
-		results:   make(map[string]Result, len(nodes)),
-		ready:     make([]string, 0, len(nodes)),
+		cfg:     e.cfg,
+		nodes:   nodes,
+		cache:   e.cache,
+		pending: make(map[string]int, len(nodes)),
+		results: make(map[string]Result, len(nodes)),
+		ready:   make([]string, 0, len(nodes)),
+	}
+	if e.cache != nil {
+		r.fps = make(map[string]uint64, len(topo))
+		r.defHashes = make(map[string]uint64, len(topo))
+		r.planReuse(topo)
 	}
 	for _, id := range topo {
-		r.pending[id] = len(nodes[id].deps)
-		if r.pending[id] == 0 {
+		if _, done := r.results[id]; done {
+			continue // 复用命中，无需调度执行
+		}
+		cnt := 0
+		for _, d := range nodes[id].deps {
+			if _, done := r.results[d]; !done {
+				cnt++ // 只统计尚未有结果（未复用）的依赖
+			}
+		}
+		r.pending[id] = cnt
+		if cnt == 0 {
 			r.ready = append(r.ready, id)
 		}
+		r.remaining++
 	}
 	return r.run(ctx)
 }
@@ -64,10 +108,67 @@ func (e *Engine) Run(ctx context.Context, tasks []Task) *RunResult {
 type runner struct {
 	cfg       Config
 	nodes     map[string]*node
+	cache     *resultCache // 与 Engine 共享；nil 表示未启用
+	fps       map[string]uint64
+	defHashes map[string]uint64
 	remaining int // 尚未到达终态的任务数
 	pending   map[string]int
 	results   map[string]Result
 	ready     []string // 已就绪待派发的任务 ID
+}
+
+// planReuse 按拓扑序计算级联指纹并判定可复用任务，预先填充结果表。
+// 复用条件（同时满足）：
+//   - 缓存中存在该任务的条目且级联指纹与本次一致（定义与上游来源均未变）；
+//   - 全部直接依赖本次也被复用（依赖若需重算，其产物无法保证与上次一致，
+//     下游必须一并重算——复用沿依赖链传递，断链即重算）。
+//
+// 每次判定都写日志，注明命中或失效原因。
+func (r *runner) planReuse(topo []string) {
+	reused := make(map[string]bool, len(topo))
+	for _, id := range topo {
+		n := r.nodes[id]
+		dh := defHashOf(n.task)
+		depFPs := make(map[string]uint64, len(n.deps))
+		for _, d := range n.deps {
+			depFPs[d] = r.fps[d]
+		}
+		fp := fingerprintOf(n.task, dh, depFPs)
+		r.fps[id] = fp
+		r.defHashes[id] = dh
+
+		ent, ok := r.cache.get(id)
+		switch {
+		case !ok:
+			r.cache.note(false)
+			r.cfg.logf("cache miss task=%s reason=no_entry", id)
+		case ent.fingerprint != fp:
+			r.cache.note(false)
+			reason := "upstream_changed"
+			if ent.defHash != dh {
+				reason = "definition_changed"
+			}
+			r.cfg.logf("cache miss task=%s reason=%s", id, reason)
+		case !allDepsReused(n, reused):
+			r.cache.note(false)
+			r.cfg.logf("cache miss task=%s reason=upstream_recomputed", id)
+		default:
+			r.cache.note(true)
+			reused[id] = true
+			r.results[id] = Result{TaskID: id, Status: StatusSuccess, Value: ent.value, Reused: true}
+			r.cfg.logf("cache hit task=%s fingerprint=%d（定义与上游产物均与上次一致，直接复用）", id, fp)
+		}
+	}
+}
+
+// allDepsReused 报告全部直接依赖本次是否均为复用命中。
+func allDepsReused(n *node, reused map[string]bool) bool {
+	for _, d := range n.deps {
+		if !reused[d] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *runner) run(ctx context.Context) *RunResult {
@@ -90,6 +191,15 @@ func (r *runner) run(ctx context.Context) *RunResult {
 		r.results[res.TaskID] = res
 		r.cfg.logf("finished task=%s status=%s kind=%q", res.TaskID, res.Status, res.Kind)
 		if res.Status == StatusSuccess {
+			if r.cache != nil {
+				// 只有正常收尾的产物才进入缓存；失败/超时/取消绝不写入。
+				r.cache.put(res.TaskID, cacheEntry{
+					fingerprint: r.fps[res.TaskID],
+					defHash:     r.defHashes[res.TaskID],
+					value:       res.Value,
+				})
+				r.cfg.logf("cache store task=%s fingerprint=%d", res.TaskID, r.fps[res.TaskID])
+			}
 			for _, ch := range r.nodes[res.TaskID].children {
 				r.pending[ch]--
 				if r.pending[ch] == 0 {

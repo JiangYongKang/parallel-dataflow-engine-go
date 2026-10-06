@@ -13,15 +13,20 @@ type node struct {
 }
 
 // buildGraph 校验任务集合并构建依赖图：
+// 任务本身不合法（空 ID / 无计算体）返回 ErrInvalidTask；
 // 重复 ID 去重（只保留首个，保证同一输入只计算一次）；
 // 引用不存在节点返回 ErrMissingDep；成环返回 ErrCycle。
+// 以上校验全部在开跑前完成，任一不通过则整体拒绝、不执行任何任务。
 // 返回确定性的拓扑序（按 ID 字典序打破平局，保证结果与调度顺序无关）。
 func buildGraph(tasks []Task) (nodes map[string]*node, topo []string, err error) {
 	nodes = make(map[string]*node, len(tasks))
 	var order []string // 去重后的声明顺序，仅用于日志与确定性
 	for _, t := range tasks {
 		if t.ID == "" {
-			return nil, nil, fmt.Errorf("%w: empty task id", ErrMissingDep)
+			return nil, nil, fmt.Errorf("%w: empty task id", ErrInvalidTask)
+		}
+		if t.Run == nil {
+			return nil, nil, fmt.Errorf("%w: task %q has no Run function", ErrInvalidTask, t.ID)
 		}
 		if _, dup := nodes[t.ID]; dup {
 			continue // 去重：同一输入重复提交只保留一次
